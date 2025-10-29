@@ -9,7 +9,6 @@ import plotly.express as px
 # CONFIG GÉNÉRALE
 # -------------------------------------------------------------------
 
-# Coordonnées de référence (Saint-Brieuc centre)
 SAINT_BRIEUC_LAT = 48.514
 SAINT_BRIEUC_LON = -2.765
 
@@ -23,9 +22,8 @@ st.set_page_config(
 
 st.title("🌤️ Météo journalière (Saint-Brieuc / Open-Meteo)")
 st.caption(
-    "Températures max/min, cumul pluie par jour. Source : Open-Meteo (données historiques modélisées/interpolées)."
+    "Températures max/min, cumul pluie par jour. Source : Open-Meteo (données historiques interpolées)."
 )
-
 
 # -------------------------------------------------------------------
 # OUTILS
@@ -33,18 +31,14 @@ st.caption(
 
 def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
     """
-    Appelle l'API Open-Meteo archive pour récupérer les données journalières :
-    - temperature_2m_max (°C)
-    - temperature_2m_min (°C)
-    - precipitation_sum (mm cumul journalier)
-    On renvoie un DataFrame avec une ligne par jour.
+    Récupère les données journalières d'Open-Meteo pour une paire (lat, lon)
+    entre start_date_str et end_date_str (YYYY-MM-DD).
     """
-
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": start_date_str,  # 'YYYY-MM-DD'
-        "end_date": end_date_str,      # 'YYYY-MM-DD'
+        "start_date": start_date_str,
+        "end_date": end_date_str,
         "daily": [
             "temperature_2m_max",
             "temperature_2m_min",
@@ -70,7 +64,6 @@ def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
         st.write("Réponse brute:", r.text[:500])
         return pd.DataFrame()
 
-    # L'API renvoie un bloc 'daily' avec des tableaux parallèles
     if "daily" not in data:
         st.warning("Pas de champ 'daily' dans la réponse.")
         return pd.DataFrame()
@@ -78,23 +71,17 @@ def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
     daily = data["daily"]
     df = pd.DataFrame(daily)
 
-    # Normalisation
-    # expected columns: time, temperature_2m_max, temperature_2m_min, precipitation_sum
-    if "time" in df.columns:
-        df["date"] = pd.to_datetime(df["time"], errors="coerce").dt.date
-    else:
-        df["date"] = pd.NaT
+    # time = liste de dates en chaîne
+    df["date"] = pd.to_datetime(df["time"], errors="coerce").dt.date
 
-    df.rename(
+    df = df.rename(
         columns={
             "temperature_2m_max": "temp_max_C",
             "temperature_2m_min": "temp_min_C",
             "precipitation_sum": "rain_mm",
-        },
-        inplace=True,
+        }
     )
 
-    # Range columns clean
     df = df[["date", "temp_max_C", "temp_min_C", "rain_mm"]]
 
     return df
@@ -102,8 +89,7 @@ def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
 
 def check_missing_days_daily(df: pd.DataFrame, start_date_obj: date, end_date_obj: date):
     """
-    Vérifie si on a bien une ligne par jour entre start_date_obj et end_date_obj inclus.
-    Renvoie (missing_days_list, all_good_bool)
+    Vérifie si chaque jour entre start_date_obj et end_date_obj est présent.
     """
     expected_days = pd.date_range(start=start_date_obj, end=end_date_obj, freq="D").date
 
@@ -118,8 +104,7 @@ def check_missing_days_daily(df: pd.DataFrame, start_date_obj: date, end_date_ob
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
-    Exporte le DataFrame en mémoire (XLSX) et renvoie les bytes,
-    pour pouvoir proposer un bouton de téléchargement.
+    Exporte le df en Excel (XLSX) en mémoire, renvoie les bytes.
     """
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -128,15 +113,14 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # -------------------------------------------------------------------
-# UI PARAMÈTRES UTILISATEUR
+# SIDEBAR
 # -------------------------------------------------------------------
 
 st.sidebar.header("⚙️ Paramètres")
 
-st.sidebar.write("📍 Localisation utilisée : Saint-Brieuc (Côtes-d'Armor, Bretagne)")
+st.sidebar.write("📍 Localisation : Saint-Brieuc (Côtes-d'Armor, Bretagne)")
 st.sidebar.write(f"Latitude : `{SAINT_BRIEUC_LAT}` | Longitude : `{SAINT_BRIEUC_LON}`")
 
-# période par défaut = les 14 derniers jours
 today_utc = datetime.utcnow().date()
 default_start = today_utc - timedelta(days=14)
 
@@ -157,13 +141,11 @@ run_query = st.sidebar.button("🔍 Récupérer la météo")
 
 st.markdown("---")
 
-
 # -------------------------------------------------------------------
-# MAIN LOGIC
+# MAIN
 # -------------------------------------------------------------------
 
 if run_query:
-    # formater en YYYY-MM-DD pour l'API
     start_str = start_date_input.strftime("%Y-%m-%d")
     end_str   = end_date_input.strftime("%Y-%m-%d")
 
@@ -181,7 +163,7 @@ if run_query:
         st.subheader("📅 Données météo journalières normalisées")
         st.dataframe(daily_df, use_container_width=True)
 
-        # contrôle de complétude
+        # check complétude
         missing_days, ok_all_days = check_missing_days_daily(
             daily_df,
             start_date_obj=start_date_input,
@@ -196,7 +178,7 @@ if run_query:
                 + ", ".join(str(d) for d in missing_days)
             )
 
-        # Graph Température max du jour
+        # graph temp max
         if daily_df["temp_max_C"].notna().any():
             fig_tmax = px.line(
                 daily_df,
@@ -210,10 +192,8 @@ if run_query:
                 yaxis_title="°C",
             )
             st.plotly_chart(fig_tmax, use_container_width=True)
-        else:
-            st.info("Pas de température max exploitable.")
 
-        # Graph Pluie journalière cumulée
+        # graph pluie
         if daily_df["rain_mm"].notna().any():
             fig_rain = px.bar(
                 daily_df,
@@ -226,10 +206,8 @@ if run_query:
                 yaxis_title="mm / jour",
             )
             st.plotly_chart(fig_rain, use_container_width=True)
-        else:
-            st.info("Pas de pluie mesurée sur la période sélectionnée.")
 
-        # Export Excel
+        # export excel
         excel_bytes = to_excel_bytes(daily_df)
         st.download_button(
             label="⬇ Télécharger l'Excel (météo journalière)",
@@ -239,23 +217,16 @@ if run_query:
         )
 
 else:
-    st.info("➡ Choisis ta période dans la barre latérale puis clique sur 'Récupérer la météo'.")
-    st.write("Astuce : tu peux ensuite fusionner ce CSV/Excel avec ton CA journalier.")
+    st.info("➡ Choisis la période dans la barre latérale puis clique sur 'Récupérer la météo'.")
 
-
-# -------------------------------------------------------------------
-# NOTES TECH / DEBUG
-# -------------------------------------------------------------------
-
-with st.expander("🔎 Détails techniques / intégration métier"):
+with st.expander("🔎 Notes techniques"):
     st.markdown(
         """
         - Source : Open-Meteo Archive API.
         - Résolution : quotidienne (déjà agrégée).
         - temp_max_C / temp_min_C : °C.
         - rain_mm : mm cumulés sur la journée.
-        - timezone forcée Europe/Paris (donc alignée avec ton CA journalier France).
-        - On vérifie qu'il n'y a pas de trous de dates entre le début et la fin.
-        - Le bouton Excel exporte exactement ce que tu vois, prêt à être mergé avec un tableau de CA (indexé par date).
+        - Les dates sont déjà en timezone Europe/Paris via l'API.
+        - Le bouton Excel exporte exactement ce tableau, prêt à fusionner avec ton CA journalier.
         """
     )
