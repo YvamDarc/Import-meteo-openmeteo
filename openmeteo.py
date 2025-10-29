@@ -4,35 +4,66 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from io import BytesIO
 import plotly.express as px
+import math
 
 # -------------------------------------------------------------------
-# CONFIG GÉNÉRALE
+# CONFIG GLOBALE
 # -------------------------------------------------------------------
-
-SAINT_BRIEUC_LAT = 48.514
-SAINT_BRIEUC_LON = -2.765
 
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 
+# Références "stations" / points météo de suivi en Bretagne
+# Tu peux en rajouter autant que tu veux (ex: magasins, villes, etc.).
+KNOWN_SITES = [
+    {
+        "name": "Saint-Brieuc",
+        "lat": 48.514,
+        "lon": -2.765,
+    },
+    {
+        "name": "Brest",
+        "lat": 48.390,
+        "lon": -4.486,
+    },
+    {
+        "name": "Rennes",
+        "lat": 48.117,
+        "lon": -1.677,
+    },
+    {
+        "name": "Quimper",
+        "lat": 47.996,
+        "lon": -4.098,
+    },
+    {
+        "name": "Vannes",
+        "lat": 47.658,
+        "lon": -2.760,
+    },
+]
+
 st.set_page_config(
-    page_title="Météo journalière - Saint-Brieuc",
+    page_title="Météo journalière Bretagne",
     page_icon="🌤️",
     layout="wide",
 )
 
-st.title("🌤️ Météo journalière (Saint-Brieuc / Open-Meteo)")
+st.title("🌤️ Météo journalière Bretagne / Open-Meteo")
 st.caption(
-    "Températures max/min, cumul pluie par jour. Source : Open-Meteo (données historiques interpolées)."
+    "Températures max/min, pluie journalière. Source : Open-Meteo. "
+    "Sélectionne ta zone, récupère les données jour par jour et exporte en Excel."
 )
 
 # -------------------------------------------------------------------
-# OUTILS
+# OUTILS MÉTÉO
 # -------------------------------------------------------------------
 
 def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
     """
-    Récupère les données journalières d'Open-Meteo pour une paire (lat, lon)
-    entre start_date_str et end_date_str (YYYY-MM-DD).
+    Récupère les données journalières d'Open-Meteo :
+    - Température max/min (°C)
+    - Pluie cumulée journalière (mm)
+    Timezone Europe/Paris → une ligne = un jour.
     """
     params = {
         "latitude": lat,
@@ -55,23 +86,23 @@ def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
     if r.status_code != 200:
         st.error(f"Erreur API Open-Meteo (HTTP {r.status_code})")
         st.write("Réponse brute:", r.text[:500])
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     try:
         data = r.json()
     except Exception as e:
         st.error(f"Réponse API illisible (pas du JSON) : {e}")
         st.write("Réponse brute:", r.text[:500])
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     if "daily" not in data:
         st.warning("Pas de champ 'daily' dans la réponse.")
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     daily = data["daily"]
     df = pd.DataFrame(daily)
 
-    # time = liste de dates en chaîne
+    # conversion des dates
     df["date"] = pd.to_datetime(df["time"], errors="coerce").dt.date
 
     df = df.rename(
@@ -84,12 +115,19 @@ def fetch_daily_weather(lat, lon, start_date_str, end_date_str):
 
     df = df[["date", "temp_max_C", "temp_min_C", "rain_mm"]]
 
-    return df
+    # l'API renvoie aussi meta type 'latitude', 'longitude', 'elevation' si on veut afficher l'altitude
+    meta = {
+        "lat_used": data.get("latitude"),
+        "lon_used": data.get("longitude"),
+        "elevation_m": data.get("elevation"),
+    }
+
+    return df, meta
 
 
 def check_missing_days_daily(df: pd.DataFrame, start_date_obj: date, end_date_obj: date):
     """
-    Vérifie si chaque jour entre start_date_obj et end_date_obj est présent.
+    Vérifie la complétude : on veut une ligne par jour dans l'intervalle demandé.
     """
     expected_days = pd.date_range(start=start_date_obj, end=end_date_obj, freq="D").date
 
@@ -104,7 +142,7 @@ def check_missing_days_daily(df: pd.DataFrame, start_date_obj: date, end_date_ob
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
-    Exporte le df en Excel (XLSX) en mémoire, renvoie les bytes.
+    Convertit le df (date/temp/pluie) en Excel en mémoire pour téléchargement.
     """
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -113,13 +151,45 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # -------------------------------------------------------------------
-# SIDEBAR
+# OUTILS LOCALISATION
 # -------------------------------------------------------------------
 
-st.sidebar.header("⚙️ Paramètres")
+def haversine_km(lat1, lon1, lat2, lon2):
+    """
+    Distance approx en km entre deux points lat/lon.
+    Formule de Haversine (sphère ~ Terre).
+    """
+    R = 6371.0  # rayon moyen Terre en km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
 
-st.sidebar.write("📍 Localisation : Saint-Brieuc (Côtes-d'Armor, Bretagne)")
-st.sidebar.write(f"Latitude : `{SAINT_BRIEUC_LAT}` | Longitude : `{SAINT_BRIEUC_LON}`")
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
+
+
+def find_closest_site(lat_user, lon_user, sites):
+    """
+    Retourne (site_dict, distance_km) du site connu le plus proche du point (lat_user, lon_user).
+    """
+    best_site = None
+    best_dist = None
+    for site in sites:
+        d = haversine_km(lat_user, lon_user, site["lat"], site["lon"])
+        if best_dist is None or d < best_dist:
+            best_dist = d
+            best_site = site
+    return best_site, best_dist
+
+
+# -------------------------------------------------------------------
+# SIDEBAR - PARAMÈTRES TEMPORELS
+# -------------------------------------------------------------------
+
+st.sidebar.header("🗓 Période d'analyse")
 
 today_utc = datetime.utcnow().date()
 default_start = today_utc - timedelta(days=14)
@@ -137,22 +207,99 @@ end_date_input = st.sidebar.date_input(
     min_value=start_date_input,
 )
 
+# -------------------------------------------------------------------
+# LOCALISATION UI
+# -------------------------------------------------------------------
+
+st.sidebar.header("📍 Localisation météo")
+
+# 1. Choix direct d'un site connu
+site_names = [site["name"] for site in KNOWN_SITES]
+default_site_index = 0  # Saint-Brieuc par défaut
+chosen_site_name = st.sidebar.selectbox(
+    "Site / station de référence",
+    options=site_names,
+    index=default_site_index,
+    help="Choisis une ville / point de référence en Bretagne."
+)
+
+chosen_site = next(s for s in KNOWN_SITES if s["name"] == chosen_site_name)
+
+st.sidebar.write(
+    f"→ {chosen_site['name']} : lat={chosen_site['lat']:.3f}, lon={chosen_site['lon']:.3f}"
+)
+
+# 2. Saisie manuelle d'un point perso (ex: magasin précis)
+st.sidebar.markdown("Ou bien précise un point personnalisé :")
+custom_lat = st.sidebar.number_input(
+    "Latitude perso",
+    value=chosen_site["lat"],
+    format="%.6f"
+)
+custom_lon = st.sidebar.number_input(
+    "Longitude perso",
+    value=chosen_site["lon"],
+    format="%.6f"
+)
+
+closest_site, closest_dist_km = find_closest_site(custom_lat, custom_lon, KNOWN_SITES)
+
+st.sidebar.markdown(
+    f"📌 Site connu le plus proche de ton point perso : **{closest_site['name']}** "
+    f"({closest_dist_km:.1f} km)"
+)
+
+st.sidebar.caption(
+    "On va interroger Open-Meteo directement à la latitude/longitude perso. "
+    "Le nom affiché sert juste pour étiqueter les graphes."
+)
+
 run_query = st.sidebar.button("🔍 Récupérer la météo")
+
+
+# -------------------------------------------------------------------
+# CARTE DES SITES
+# -------------------------------------------------------------------
+
+st.subheader("🗺 Carte des sites météo connus / points d'analyse")
+
+map_df = pd.DataFrame(
+    [
+        {
+            "site": site["name"],
+            "lat": site["lat"],
+            "lon": site["lon"],
+        }
+        for site in KNOWN_SITES
+    ]
+)
+
+st.map(
+    data=map_df.rename(columns={"lat": "latitude", "lon": "longitude"}),
+    zoom=7,
+)
+
+st.caption(
+    "Les points affichés sont les localisations de référence configurées. "
+    "Tu peux saisir une latitude/longitude perso dans la barre latérale."
+)
 
 st.markdown("---")
 
+
 # -------------------------------------------------------------------
-# MAIN
+# MAIN : APPEL METEO + ANALYSE
 # -------------------------------------------------------------------
 
 if run_query:
     start_str = start_date_input.strftime("%Y-%m-%d")
     end_str   = end_date_input.strftime("%Y-%m-%d")
 
+    # On interroge Open-Meteo AVEC la localisation perso (custom_lat/custom_lon)
     with st.spinner("Appel Open-Meteo (données journalières)..."):
-        daily_df = fetch_daily_weather(
-            lat=SAINT_BRIEUC_LAT,
-            lon=SAINT_BRIEUC_LON,
+        daily_df, meta_info = fetch_daily_weather(
+            lat=custom_lat,
+            lon=custom_lon,
             start_date_str=start_str,
             end_date_str=end_str,
         )
@@ -160,10 +307,26 @@ if run_query:
     if daily_df.empty:
         st.warning("Aucune donnée retournée par Open-Meteo pour cet intervalle.")
     else:
+        # bloc info localisation effective
+        st.subheader("📌 Localisation utilisée")
+        colA, colB, colC = st.columns(3)
+        with colA:
+            st.metric("Point choisi (lat)", f"{custom_lat:.4f}")
+        with colB:
+            st.metric("Point choisi (lon)", f"{custom_lon:.4f}")
+        with colC:
+            st.write(f"Site connu le plus proche : **{closest_site['name']}** ({closest_dist_km:.1f} km)")
+        if meta_info:
+            st.write(
+                f"ℹ️ Open-Meteo a répondu pour lat={meta_info['lat_used']}, "
+                f"lon={meta_info['lon_used']}, altitude≈{meta_info['elevation_m']} m."
+            )
+
+        # tableau météo jour par jour
         st.subheader("📅 Données météo journalières normalisées")
         st.dataframe(daily_df, use_container_width=True)
 
-        # check complétude
+        # contrôle complétude
         missing_days, ok_all_days = check_missing_days_daily(
             daily_df,
             start_date_obj=start_date_input,
@@ -178,14 +341,14 @@ if run_query:
                 + ", ".join(str(d) for d in missing_days)
             )
 
-        # graph temp max
+        # graph température max
         if daily_df["temp_max_C"].notna().any():
             fig_tmax = px.line(
                 daily_df,
                 x="date",
                 y="temp_max_C",
                 markers=True,
-                title="Température max quotidienne (°C)",
+                title=f"Température max quotidienne (°C) - {closest_site['name']}",
             )
             fig_tmax.update_layout(
                 xaxis_title="Jour",
@@ -199,7 +362,7 @@ if run_query:
                 daily_df,
                 x="date",
                 y="rain_mm",
-                title="Pluie cumulée sur la journée (mm)",
+                title=f"Pluie cumulée sur la journée (mm) - {closest_site['name']}",
             )
             fig_rain.update_layout(
                 xaxis_title="Jour",
@@ -207,26 +370,33 @@ if run_query:
             )
             st.plotly_chart(fig_rain, use_container_width=True)
 
-        # export excel
+        # export Excel
         excel_bytes = to_excel_bytes(daily_df)
         st.download_button(
             label="⬇ Télécharger l'Excel (météo journalière)",
             data=excel_bytes,
-            file_name=f"meteo_saint-brieuc_{start_str}_to_{end_str}.xlsx",
+            file_name=f"meteo_{closest_site['name'].lower().replace(' ','-')}_{start_str}_to_{end_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 else:
-    st.info("➡ Choisis la période dans la barre latérale puis clique sur 'Récupérer la météo'.")
+    st.info("➡ Choisis ta période, ta localisation personnalisée (ou une ville connue), puis clique sur 'Récupérer la météo'.")
 
-with st.expander("🔎 Notes techniques"):
+
+# -------------------------------------------------------------------
+# NOTES TECH
+# -------------------------------------------------------------------
+
+with st.expander("🔎 Notes techniques / intégration métier"):
     st.markdown(
         """
-        - Source : Open-Meteo Archive API.
-        - Résolution : quotidienne (déjà agrégée).
-        - temp_max_C / temp_min_C : °C.
-        - rain_mm : mm cumulés sur la journée.
-        - Les dates sont déjà en timezone Europe/Paris via l'API.
-        - Le bouton Excel exporte exactement ce tableau, prêt à fusionner avec ton CA journalier.
+        **Comment ça marche :**
+        - Les points affichés sur la carte sont des localisations de référence (villes/stations Bretagne).
+        - Tu peux saisir une latitude / longitude perso (par ex. l'adresse d'un magasin).
+        - On calcule automatiquement le point connu le plus proche, juste pour l'étiquette.
+        - L'appel Open-Meteo se fait sur TES coordonnées perso en direct.
+        - Résultat : une ligne/jour (température max/min, pluie cumulée).
+        - On contrôle qu'il ne manque pas de jour entre les bornes.
+        - Tu peux télécharger l'Excel pour le merger avec ton CA journalier.
         """
     )
